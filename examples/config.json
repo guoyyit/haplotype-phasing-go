@@ -1,0 +1,8 @@
+{
+  "min_edge_support": 1,
+  "min_reads_per_site": 1,
+  "min_block_confidence": 0.9,
+  "read_error_rate": 0.01,
+  "seed_enabled": false,
+  "random_seed": 0
+}

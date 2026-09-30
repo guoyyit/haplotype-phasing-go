@@ -1,0 +1,5 @@
+read_id	sample_id	variant_id	allele
+r1	child	v1	0
+r1	child	v2	1
+r2	unrelated	v3	0
+r2	unrelated	v4	1
