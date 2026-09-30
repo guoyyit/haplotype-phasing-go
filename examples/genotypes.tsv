@@ -1,0 +1,14 @@
+#genotypes
+# sample	variant_id	gt (unphased, "/" or "|"; "." = missing)
+child	v1	A/G
+child	v2	C/T
+child	v3	G/A
+child	v4	./.
+father	v1	A/A
+father	v2	C/T
+father	v3	G/A
+father	v4	T/T
+mother	v1	G/G
+mother	v2	C/T
+mother	v3	G/A
+mother	v4	T/C

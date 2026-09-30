@@ -1,0 +1,10 @@
+{
+  "min_edge_support": 2,
+  "min_edge_strength": 0.8,
+  "min_block_confidence": 0.95,
+  "block_max_error_rate": 0.25,
+  "min_site_depth": 3,
+  "seed": 1,
+  "enable_trio": true,
+  "enable_reads": true
+}

@@ -1,0 +1,6 @@
+#variants
+# variant_id	chrom	pos	ref	alt
+v1	chr1	100	A	G
+v2	chr1	200	C	T
+v3	chr1	300	G	A
+v4	chr1	400	T	C

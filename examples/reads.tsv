@@ -1,0 +1,8 @@
+#reads
+# read_id	sample	variant_id	allele
+r1	child	v1	A
+r1	child	v2	T
+r2	child	v1	G
+r2	child	v2	C
+r3	child	v2	T
+r3	child	v3	A
