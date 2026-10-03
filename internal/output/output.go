@@ -12,7 +12,14 @@ import (
 )
 
 // FileVersion is the stable phased-output format version.
-const FileVersion = "1.0"
+//
+// Version history:
+//   - 1.0: initial stable format.
+//   - 1.1: violated heterozygous sites record their canonical allele calls
+//     (A0/A1) so the genotype can be reconstructed on re-read; 1.0 files
+//     recorded "." for both alleles, which loses the genotype and cannot be
+//     re-read correctly.
+const FileVersion = "1.1"
 
 // WritePhased writes the stable, re-readable phased result format.
 func WritePhased(w io.Writer, ds *model.Dataset, res *model.Result, cfg config.Config) error {

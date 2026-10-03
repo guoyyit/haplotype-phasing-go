@@ -362,13 +362,21 @@ func buildSitePhases(ds *model.Dataset, sample string, sites []siteInfo, layout 
 		case info.violated:
 			sp.Phased = false
 			sp.Hetero = info.hetero
-			if info.present && info.ploidy == 2 && !info.hetero {
-				gt := ds.GT[sample][i]
-				call := model.AlleleA0
-				if gt.A1 != info.a0 && gt.A1 == info.a1 {
-					call = model.AlleleA1
+			if info.present && info.ploidy == 2 {
+				if info.hetero {
+					// Violated heterozygous site: record the canonical allele
+					// calls so the genotype can be reconstructed on re-read.
+					// The phase is unknown (unphased), but the two alleles
+					// are the site's ref and alt.
+					sp.H1, sp.H2 = model.AlleleA0, model.AlleleA1
+				} else {
+					gt := ds.GT[sample][i]
+					call := model.AlleleA0
+					if gt.A1 != info.a0 && gt.A1 == info.a1 {
+						call = model.AlleleA1
+					}
+					sp.H1, sp.H2 = call, call
 				}
-				sp.H1, sp.H2 = call, call
 			}
 		case info.hetero:
 			sp.Phased = true

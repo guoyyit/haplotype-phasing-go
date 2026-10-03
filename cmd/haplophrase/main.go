@@ -92,20 +92,32 @@ func verifyReread(path string) error {
 	if err != nil {
 		return err
 	}
-	if normalizeLines(string(original)) != normalizeLines(buf.String()) {
-		return fmt.Errorf("reread verification FAILED: re-phasing produced a different result")
+	if lineNo, origLine, regenLine, ok := firstLineDiff(string(original), buf.String()); !ok {
+		return fmt.Errorf("reread verification FAILED: first differing line %d\n  original:   %q\n  regenerated: %q", lineNo, origLine, regenLine)
 	}
 	fmt.Println("reread verification OK: identical phasing")
 	return nil
 }
 
-// normalizeLines drops trailing whitespace per line for tolerant comparison.
-func normalizeLines(s string) string {
-	var out []string
-	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
-		out = append(out, strings.TrimRight(line, "\r "))
+// firstLineDiff compares two phased outputs line by line and returns the
+// 1-based line number and content of the first differing line. Trailing
+// whitespace per line is ignored to match the tolerant comparison.
+func firstLineDiff(original, regenerated string) (lineNo int, origLine, regenLine string, ok bool) {
+	a := strings.Split(strings.TrimSpace(original), "\n")
+	b := strings.Split(strings.TrimSpace(regenerated), "\n")
+	for i := 0; i < len(a) || i < len(b); i++ {
+		var x, y string
+		if i < len(a) {
+			x = strings.TrimRight(a[i], "\r ")
+		}
+		if i < len(b) {
+			y = strings.TrimRight(b[i], "\r ")
+		}
+		if x != y {
+			return i + 1, x, y, false
+		}
 	}
-	return strings.Join(out, "\n")
+	return 0, "", "", true
 }
 
 func writeAtomic(path string, fn func(*os.File) error) error {

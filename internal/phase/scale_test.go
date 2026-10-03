@@ -1,12 +1,17 @@
 package phase
 
 import (
+	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
 	"github.com/guoyyit/haplotype-phasing-go/internal/config"
 	"github.com/guoyyit/haplotype-phasing-go/internal/model"
+	"github.com/guoyyit/haplotype-phasing-go/internal/output"
+	"github.com/guoyyit/haplotype-phasing-go/internal/parseinput"
 )
 
 // The documented supported boundary: 10,000 variants, 50 samples,
@@ -90,4 +95,82 @@ func makeScaleDataset(nVariants, nSamples, nReads int) *model.Dataset {
 		})
 	}
 	return ds
+}
+
+// makeScaleDatasetWithTrios builds on makeScaleDataset and adds a few
+// consistent trios to exercise the trio path at scale.
+func makeScaleDatasetWithTrios(nVariants, nSamples, nReads int) *model.Dataset {
+	ds := makeScaleDataset(nVariants, nSamples, nReads)
+	if nSamples >= 3 {
+		ds.Trios = []model.Trio{
+			{Child: ds.Samples[0], Father: ds.Samples[1], Mother: ds.Samples[2]},
+		}
+	}
+	return ds
+}
+
+// runScaleRoundTrip runs the full pipeline (phase -> write -> re-read ->
+// re-phase -> re-write) and returns the original and regenerated outputs.
+func runScaleRoundTrip(t *testing.T, ds *model.Dataset, cfg config.Config) (orig, regen string) {
+	t.Helper()
+	res := Run(ds, cfg)
+	var buf bytes.Buffer
+	if err := output.WritePhased(&buf, ds, res, cfg); err != nil {
+		t.Fatal(err)
+	}
+	orig = buf.String()
+	path := filepath.Join(t.TempDir(), "phased.tsv")
+	if err := os.WriteFile(path, []byte(orig), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ds2, _, cfg2, _, err := parseinput.LoadPhased(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf2 bytes.Buffer
+	if err := output.WritePhased(&buf2, ds2, Run(ds2, cfg2), cfg2); err != nil {
+		t.Fatal(err)
+	}
+	regen = buf2.String()
+	return orig, regen
+}
+
+// TestScaleRereadCompletes verifies that the re-read verification path
+// completes at a moderate scale and produces a byte-identical result.
+func TestScaleRereadCompletes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale reread skipped in -short mode")
+	}
+	ds := makeScaleDatasetWithTrios(500, 10, 5000)
+	cfg := config.Default()
+	orig, regen := runScaleRoundTrip(t, ds, cfg)
+	if orig != regen {
+		t.Fatalf("scale re-read produced a different result (orig %d bytes, regen %d bytes)", len(orig), len(regen))
+	}
+}
+
+// BenchmarkScaleReread measures the full re-read verification path at the
+// documented boundary. The re-read work must grow smoothly with scale.
+func BenchmarkScaleReread(b *testing.B) {
+	ds := makeScaleDatasetWithTrios(10000, 50, 100000)
+	cfg := config.Default()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		var buf bytes.Buffer
+		if err := output.WritePhased(&buf, ds, Run(ds, cfg), cfg); err != nil {
+			b.Fatal(err)
+		}
+		path := filepath.Join(b.TempDir(), "phased.tsv")
+		if err := os.WriteFile(path, []byte(buf.String()), 0644); err != nil {
+			b.Fatal(err)
+		}
+		ds2, _, cfg2, _, err := parseinput.LoadPhased(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		var buf2 bytes.Buffer
+		if err := output.WritePhased(&buf2, ds2, Run(ds2, cfg2), cfg2); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

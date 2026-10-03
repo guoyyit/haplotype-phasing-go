@@ -145,12 +145,52 @@ func parseGenotypes(path string, ds *model.Dataset, notices *[]string) error {
 		if !gt.Present {
 			*notices = append(*notices, fmt.Sprintf("missing genotype: sample=%s variant=%s line=%d", sampleID, variantID, lineNo))
 		}
+		if gt.Present {
+			gt = validateGenotypeAlleles(gt, ds.Variants[idx], sampleID, variantID, lineNo, notices)
+		}
 		ds.GT[sampleID][idx] = gt
 	}
 	return scanner.Err()
 }
 
-// parseGenotype accepts ./. , ./A , A/A , A/B with either / or | separator.
+// validateGenotypeAlleles rejects any allele that is not the variant's
+// reference or alternate allele: such an allele is treated as missing
+// (rejected, never silently rewritten and never emitted as a third allele)
+// and the rejection is reported as a notice. The returned genotype has the
+// same ploidy semantics as parseGenotype.
+func validateGenotypeAlleles(gt model.Genotype, variant model.Variant, sampleID, variantID string, lineNo int, notices *[]string) model.Genotype {
+	if gt.Ploidy == 2 {
+		if gt.A1 != variant.Ref && gt.A1 != variant.Alt {
+			*notices = append(*notices, fmt.Sprintf("genotype allele rejected (not ref/alt): sample=%s variant=%s allele=%s line=%d", sampleID, variantID, gt.A1, lineNo))
+			gt.A1 = ""
+		}
+		if gt.A2 != variant.Ref && gt.A2 != variant.Alt {
+			*notices = append(*notices, fmt.Sprintf("genotype allele rejected (not ref/alt): sample=%s variant=%s allele=%s line=%d", sampleID, variantID, gt.A2, lineNo))
+			gt.A2 = ""
+		}
+		switch {
+		case gt.A1 == "" && gt.A2 == "":
+			return model.Genotype{Present: true, Ploidy: 0}
+		case gt.A1 == "":
+			return model.Genotype{Present: true, Ploidy: 1, A1: gt.A2}
+		case gt.A2 == "":
+			return model.Genotype{Present: true, Ploidy: 1, A1: gt.A1}
+		}
+		return gt
+	}
+	if gt.Ploidy == 1 {
+		if gt.A1 != variant.Ref && gt.A1 != variant.Alt {
+			*notices = append(*notices, fmt.Sprintf("genotype allele rejected (not ref/alt): sample=%s variant=%s allele=%s line=%d", sampleID, variantID, gt.A1, lineNo))
+			return model.Genotype{Present: true, Ploidy: 0}
+		}
+	}
+	return gt
+}
+
+// parseGenotype accepts ./. , ./A , A/. , A/A , A/B with either / or |
+// separator. The missing notation "." (or an empty side) is handled on
+// either side: a single observed allele yields ploidy 1, two missing sides
+// yield ploidy 0.
 func parseGenotype(token string) model.Genotype {
 	token = strings.ReplaceAll(token, "|", "/")
 	parts := strings.Split(token, "/")
@@ -159,10 +199,14 @@ func parseGenotype(token string) model.Genotype {
 		return gt
 	}
 	a1, a2 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-	if a1 == "." && a2 == "." {
+	m1 := a1 == "." || a1 == ""
+	m2 := a2 == "." || a2 == ""
+	switch {
+	case m1 && m2:
 		return model.Genotype{Present: true, Ploidy: 0}
-	}
-	if a2 == "." || a2 == "" {
+	case m1:
+		return model.Genotype{Present: true, Ploidy: 1, A1: a2}
+	case m2:
 		return model.Genotype{Present: true, Ploidy: 1, A1: a1}
 	}
 	return model.Genotype{Present: true, Ploidy: 2, A1: a1, A2: a2}
@@ -390,6 +434,13 @@ func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []s
 			sp, siteErr := parsePhaseRow(fields, path, lineNo)
 			if siteErr != nil {
 				return nil, nil, cfg, nil, siteErr
+			}
+			// Legacy 1.0 files recorded "." for both alleles of a violated
+			// heterozygous site, which loses the genotype and cannot be
+			// re-read correctly. Give a clear, locatable compatibility error
+			// instead of an unlocatable verification failure.
+			if sp.Violation && (sp.H1 == model.AlleleMissing || sp.H2 == model.AlleleMissing) {
+				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: legacy phased file (format 1.0): violated site %q has missing allele calls; re-run phasing with the current version to produce a re-readable file", path, lineNo, sp.VariantID)
 			}
 			curSites = append(curSites, sp)
 			ds.GT[fields[0]][sp.Index] = reconstructGenotype(sp)

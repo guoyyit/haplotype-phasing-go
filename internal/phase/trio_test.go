@@ -88,6 +88,54 @@ func TestMissingParentsAreUninformative(t *testing.T) {
 	}
 }
 
+// A violated heterozygous site must record the canonical allele calls so the
+// genotype can be reconstructed on re-read; the phase stays unphased.
+func TestViolatedHetRecordsCanonicalAlleleCalls(t *testing.T) {
+	ds := &model.Dataset{
+		Variants: []model.Variant{{ID: "v1", Ref: "A", Alt: "G"}},
+		Samples:  []string{"c", "f", "m"},
+		GT: map[string][]model.Genotype{
+			"c": {{Present: true, Ploidy: 2, A1: "A", A2: "G"}},
+			"f": {{Present: true, Ploidy: 2, A1: "G", A2: "G"}},
+			"m": {{Present: true, Ploidy: 2, A1: "G", A2: "G"}},
+		},
+		Trios: []model.Trio{{Child: "c", Father: "f", Mother: "m"}},
+	}
+	res := Run(ds, config.Default())
+	site := res.Samples["c"].Sites[0]
+	if !site.Violation || !site.Hetero || site.Phased {
+		t.Fatalf("violated het must be flagged, hetero and unphased: %+v", site)
+	}
+	if site.H1 != model.AlleleA0 || site.H2 != model.AlleleA1 {
+		t.Fatalf("violated het must record canonical allele calls A0/A1: %v/%v", site.H1, site.H2)
+	}
+	if res.Stats.TrioViolations != 1 {
+		t.Fatalf("expected 1 trio violation, got %d", res.Stats.TrioViolations)
+	}
+}
+
+// A violated homozygous site must record the homozygous allele calls.
+func TestViolatedHomoRecordsAlleleCalls(t *testing.T) {
+	ds := &model.Dataset{
+		Variants: []model.Variant{{ID: "v1", Ref: "C", Alt: "T"}},
+		Samples:  []string{"c", "f", "m"},
+		GT: map[string][]model.Genotype{
+			"c": {{Present: true, Ploidy: 2, A1: "C", A2: "C"}},
+			"f": {{Present: true, Ploidy: 2, A1: "T", A2: "T"}},
+			"m": {{Present: true, Ploidy: 2, A1: "T", A2: "T"}},
+		},
+		Trios: []model.Trio{{Child: "c", Father: "f", Mother: "m"}},
+	}
+	res := Run(ds, config.Default())
+	site := res.Samples["c"].Sites[0]
+	if !site.Violation || site.Hetero || site.Phased {
+		t.Fatalf("violated homo must be flagged, not hetero and unphased: %+v", site)
+	}
+	if site.H1 != model.AlleleA0 || site.H2 != model.AlleleA0 {
+		t.Fatalf("violated homo must record homozygous allele calls: %v/%v", site.H1, site.H2)
+	}
+}
+
 // Weighted trio evidence overrides a single contradicting read pair and the
 // read-vs-trio orientation disagreement is reported, not silently dropped.
 func TestTrioEdgeOverridesSingleReadAndCountsConflict(t *testing.T) {
