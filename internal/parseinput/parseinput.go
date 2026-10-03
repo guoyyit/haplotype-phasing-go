@@ -37,7 +37,10 @@ func LoadDataset(variantsPath, genotypesPath, readsPath, triosPath string) (ds *
 }
 
 // LoadPhased reads a previously written phased result file.
-func LoadPhased(path string) (*model.Dataset, *model.Result, config.Config, []string, error) {
+// The returned version is the format version recorded in the file header
+// ("1.0" when absent); callers must re-emit the same version so that legacy
+// result files verify byte-for-byte.
+func LoadPhased(path string) (*model.Dataset, *model.Result, config.Config, []string, string, error) {
 	return parsePhased(path)
 }
 
@@ -141,7 +144,10 @@ func parseGenotypes(path string, ds *model.Dataset, notices *[]string) error {
 			ds.Samples = append(ds.Samples, sampleID)
 			ds.GT[sampleID] = make([]model.Genotype, len(ds.Variants))
 		}
-		gt := parseGenotype(fields[2])
+		gt, gtErr := parseGenotype(fields[2], ds.Variants[idx])
+		if gtErr != nil {
+			return fmt.Errorf("%s:%d: %w", path, lineNo, gtErr)
+		}
 		if !gt.Present {
 			*notices = append(*notices, fmt.Sprintf("missing genotype: sample=%s variant=%s line=%d", sampleID, variantID, lineNo))
 		}
@@ -150,22 +156,50 @@ func parseGenotypes(path string, ds *model.Dataset, notices *[]string) error {
 	return scanner.Err()
 }
 
-// parseGenotype accepts ./. , ./A , A/A , A/B with either / or | separator.
-func parseGenotype(token string) model.Genotype {
+// parseGenotype accepts ./. , ./A , A/. , A/A , A/B with either / or |
+// separator. The missing token "." is symmetric on either allele position:
+// one missing allele means a ploidy-1 partial genotype that keeps the single
+// observed allele; two missing alleles mean a ploidy-0 full absence. An
+// observed allele that is neither the site ref nor the site alt is rejected
+// explicitly rather than silently carried into the output as a third allele.
+func parseGenotype(token string, variant model.Variant) (model.Genotype, error) {
 	token = strings.ReplaceAll(token, "|", "/")
 	parts := strings.Split(token, "/")
-	gt := model.Genotype{}
 	if len(parts) != 2 {
-		return gt
+		return model.Genotype{}, fmt.Errorf("invalid genotype %q: expected allele/allele with / or | separator", token)
 	}
 	a1, a2 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-	if a1 == "." && a2 == "." {
-		return model.Genotype{Present: true, Ploidy: 0}
+	miss1, miss2 := a1 == "." || a1 == "", a2 == "." || a2 == ""
+	if miss1 && miss2 {
+		return model.Genotype{Present: true, Ploidy: 0}, nil
 	}
-	if a2 == "." || a2 == "" {
-		return model.Genotype{Present: true, Ploidy: 1, A1: a1}
+	checkAllele := func(a string) error {
+		if a != variant.Ref && a != variant.Alt {
+			return fmt.Errorf("genotype allele %q at variant %s is neither ref %q nor alt %q",
+				a, variant.ID, variant.Ref, variant.Alt)
+		}
+		return nil
 	}
-	return model.Genotype{Present: true, Ploidy: 2, A1: a1, A2: a2}
+	switch {
+	case miss1:
+		if err := checkAllele(a2); err != nil {
+			return model.Genotype{}, err
+		}
+		return model.Genotype{Present: true, Ploidy: 1, A1: a2}, nil
+	case miss2:
+		if err := checkAllele(a1); err != nil {
+			return model.Genotype{}, err
+		}
+		return model.Genotype{Present: true, Ploidy: 1, A1: a1}, nil
+	default:
+		if err := checkAllele(a1); err != nil {
+			return model.Genotype{}, err
+		}
+		if err := checkAllele(a2); err != nil {
+			return model.Genotype{}, err
+		}
+		return model.Genotype{Present: true, Ploidy: 2, A1: a1, A2: a2}, nil
+	}
 }
 
 // readKey groups observations of one (read, sample).
@@ -301,10 +335,10 @@ func parseTrios(path string, ds *model.Dataset) error {
 // parsePhased reads the sectioned phased output file produced by output.WritePhased.
 //
 // Sections: #variants, #trios, #config, #phase, #blocks, #stats.
-func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []string, error) {
+func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []string, string, error) {
 	file, scanner, err := openLines(path)
 	if err != nil {
-		return nil, nil, config.Config{}, nil, err
+		return nil, nil, config.Config{}, nil, "", err
 	}
 	defer file.Close()
 
@@ -312,6 +346,13 @@ func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []s
 	res := &model.Result{Samples: map[string]*model.SampleResult{}}
 	cfg := config.Default()
 	var notices []string
+	// readIndex maps (read_id, sample) to its position in ds.Reads so the
+	// #reads section groups observations in O(1) instead of rescanning.
+	readIndex := map[readKey]int{}
+	variantIndex := map[string]int{}
+	// Files without an explicit header are treated as the original 1.0
+	// format; every released writer emits one.
+	version := "1.0"
 	section := ""
 	headerSeen := map[string]bool{}
 
@@ -338,45 +379,51 @@ func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []s
 			curSample, curSites = "", nil
 			tokens := strings.Split(line, "\t")
 			section = strings.TrimSpace(strings.TrimPrefix(tokens[0], "#"))
+			if section == "haplophased" && len(tokens) >= 2 {
+				version = strings.TrimSpace(tokens[1])
+			}
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if section != "config" && !headerSeen[section] {
+		// The #stats section has no column-header row; every other
+		// section skips its first non-comment row as its header.
+		if section != "config" && section != "stats" && !headerSeen[section] {
 			headerSeen[section] = true
 			continue // column header row
 		}
 		switch section {
 		case "variants":
 			if len(fields) < 5 {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: malformed variants row", path, lineNo)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: malformed variants row", path, lineNo)
 			}
 			pos, convErr := strconv.Atoi(fields[2])
 			if convErr != nil {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: invalid pos", path, lineNo)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: invalid pos", path, lineNo)
 			}
 			ds.Variants = append(ds.Variants, model.Variant{
 				ID: fields[0], Chrom: fields[1], Pos: pos, Ref: fields[3], Alt: fields[4],
 			})
+			variantIndex[fields[0]] = len(ds.Variants) - 1
 		case "trios":
 			if len(fields) < 3 {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: malformed trios row", path, lineNo)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: malformed trios row", path, lineNo)
 			}
 			ds.Trios = append(ds.Trios, model.Trio{Child: fields[0], Father: fields[1], Mother: fields[2]})
 		case "reads":
 			if len(fields) < 4 {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: malformed reads row", path, lineNo)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: malformed reads row", path, lineNo)
 			}
-			if err := appendPhasedRead(ds, fields, path, lineNo); err != nil {
-				return nil, nil, cfg, nil, err
+			if err := appendPhasedRead(ds, readIndex, variantIndex, fields, path, lineNo); err != nil {
+				return nil, nil, cfg, nil, version, err
 			}
 		case "config":
 			if jsonErr := json.Unmarshal([]byte(line), &cfg); jsonErr != nil {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: malformed config: %w", path, lineNo, jsonErr)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: malformed config: %w", path, lineNo, jsonErr)
 			}
 		case "phase":
 			// sample variant_index variant_id status low_cov a0 a1 h1 h2 violation
 			if len(fields) < 10 {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: malformed phase row", path, lineNo)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: malformed phase row", path, lineNo)
 			}
 			if _, ok := ds.GT[fields[0]]; !ok {
 				ds.Samples = append(ds.Samples, fields[0])
@@ -387,20 +434,20 @@ func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []s
 				curSample = fields[0]
 				curSites = nil
 			}
-			sp, siteErr := parsePhaseRow(fields, path, lineNo)
+			sp, status, siteErr := parsePhaseRow(fields, path, lineNo)
 			if siteErr != nil {
-				return nil, nil, cfg, nil, siteErr
+				return nil, nil, cfg, nil, version, siteErr
 			}
 			curSites = append(curSites, sp)
-			ds.GT[fields[0]][sp.Index] = reconstructGenotype(sp)
+			ds.GT[fields[0]][sp.Index] = reconstructGenotype(sp, status, version == "1.0")
 		case "blocks":
 			// sample block_id start end sites hets support conflict confidence error_rate status
 			if len(fields) < 11 {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: malformed blocks row", path, lineNo)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: malformed blocks row", path, lineNo)
 			}
 			b, blockErr := parseBlockRow(fields, path, lineNo)
 			if blockErr != nil {
-				return nil, nil, cfg, nil, blockErr
+				return nil, nil, cfg, nil, version, blockErr
 			}
 			if sr, ok := res.Samples[fields[0]]; ok {
 				sr.Blocks = append(sr.Blocks, b)
@@ -410,14 +457,17 @@ func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []s
 				continue
 			}
 			if err := parseStatsRow(&res.Stats, fields[0], fields[1]); err != nil {
-				return nil, nil, cfg, nil, fmt.Errorf("%s:%d: %w", path, lineNo, err)
+				return nil, nil, cfg, nil, version, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, cfg, nil, err
+		return nil, nil, cfg, nil, version, err
 	}
 	flushSample(curSample, curSites)
+	if version != "1.0" && version != "1.1" {
+		return nil, nil, cfg, nil, version, fmt.Errorf("%s: unsupported phased format version %q", path, version)
+	}
 
 	// Recompute per-sample counters from rows so reload yields an equal result.
 	for _, sampleID := range res.Order {
@@ -441,37 +491,27 @@ func parsePhased(path string) (*model.Dataset, *model.Result, config.Config, []s
 			return ds.Reads[i].Observations[a].VariantIdx < ds.Reads[i].Observations[b].VariantIdx
 		})
 	}
-	return ds, res, cfg, notices, nil
+	return ds, res, cfg, notices, version, nil
 }
 
 // appendPhasedRead adds one #reads row, grouping rows into ds.Reads in
 // deterministic (read_id, sample) first-appearance order.
-func appendPhasedRead(ds *model.Dataset, f []string, path string, lineNo int) error {
+func appendPhasedRead(ds *model.Dataset, readIndex map[readKey]int, variantIndex map[string]int, f []string, path string, lineNo int) error {
 	readID, sampleID, variantID, allele := f[0], f[1], f[2], f[3]
-	idx := -1
-	for i, variant := range ds.Variants {
-		if variant.ID == variantID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	idx, known := variantIndex[variantID]
+	if !known {
 		return fmt.Errorf("%s:%d: unknown variant id %q in reads", path, lineNo, variantID)
 	}
 	variant := ds.Variants[idx]
 	if allele != variant.Ref && allele != variant.Alt {
 		return fmt.Errorf("%s:%d: allele %q is not ref/alt for %s", path, lineNo, allele, variantID)
 	}
-	pos := -1
-	for i := range ds.Reads {
-		if ds.Reads[i].ID == readID && ds.Reads[i].Sample == sampleID {
-			pos = i
-			break
-		}
-	}
-	if pos < 0 {
+	key := readKey{sample: sampleID, readID: readID}
+	pos, ok := readIndex[key]
+	if !ok {
 		ds.Reads = append(ds.Reads, model.Read{ID: readID, Sample: sampleID})
 		pos = len(ds.Reads) - 1
+		readIndex[key] = pos
 	}
 	ds.Reads[pos].Observations = append(ds.Reads[pos].Observations, model.ReadObservation{
 		VariantIdx: idx, Allele: allele,
@@ -480,16 +520,21 @@ func appendPhasedRead(ds *model.Dataset, f []string, path string, lineNo int) er
 }
 
 // parsePhaseRow parses one #phase row into a SitePhase.
-func parsePhaseRow(f []string, path string, lineNo int) (model.SitePhase, error) {
+func parsePhaseRow(f []string, path string, lineNo int) (model.SitePhase, string, error) {
 	idx, err := strconv.Atoi(f[1])
 	if err != nil {
-		return model.SitePhase{}, fmt.Errorf("%s:%d: invalid variant index", path, lineNo)
+		return model.SitePhase{}, "", fmt.Errorf("%s:%d: invalid variant index", path, lineNo)
 	}
+	status := f[3]
 	sp := model.SitePhase{
 		Index:     idx,
 		VariantID: f[2],
-		Phased:    f[3] == model.SiteStatusPhased,
-		Hetero:    f[3] == model.SiteStatusPhased || f[3] == model.SiteStatusUnphased,
+		Phased:    status == model.SiteStatusPhased,
+		// UNPHASED covers both violating heterozygotes and violating
+		// homozygotes; the latter are distinguished below by their two
+		// identical haplotype calls (or, in 1.0 files, by reconstruction).
+		Hetero: status == model.SiteStatusPhased ||
+			(status == model.SiteStatusUnphased && f[7] != f[8]),
 		LowCov:    f[4] == "1",
 		A0:        f[5],
 		A1:        f[6],
@@ -505,11 +550,17 @@ func parsePhaseRow(f []string, path string, lineNo int) (model.SitePhase, error)
 	} else if f[8] == "A1" {
 		sp.H2 = model.AlleleA1
 	}
-	return sp, nil
+	return sp, status, nil
 }
 
 // reconstructGenotype rebuilds an unphased Genotype from a phased site row.
-func reconstructGenotype(sp model.SitePhase) model.Genotype {
+// legacyV1Dot0 records whether the row came from a format 1.0 file, where
+// violating heterozygous sites were written with two "." calls. In that
+// case a dots-only UNPHASED row is reconstructed as a heterozygous genotype,
+// which is what re-deriving the violation and re-emitting the row verbatim
+// requires; format 1.1 distinguishes hetero (A0/A1) from homozygous
+// violations explicitly.
+func reconstructGenotype(sp model.SitePhase, status string, legacyV1Dot0 bool) model.Genotype {
 	call := func(c model.AlleleCall) (string, bool) {
 		switch c {
 		case model.AlleleA0:
@@ -524,6 +575,12 @@ func reconstructGenotype(sp model.SitePhase) model.Genotype {
 	a2, ok2 := call(sp.H2)
 	switch {
 	case !ok1 && !ok2:
+		if legacyV1Dot0 && status == model.SiteStatusUnphased && sp.Violation {
+			// Format 1.0 encoded violating heterozygous sites as two
+			// missing calls; reconstruct the hetero genotype so the
+			// violation re-derives identically and the 1.0 row re-emits.
+			return model.Genotype{Present: true, Ploidy: 2, A1: sp.A0, A2: sp.A1}
+		}
 		return model.Genotype{Present: true, Ploidy: 0}
 	case !ok2:
 		return model.Genotype{Present: true, Ploidy: 1, A1: a1}

@@ -85,12 +85,15 @@ func TestPhasedRoundTrip(t *testing.T) {
 	}
 	phasedPath := writeTmp(t, "phased.tsv", buf.String())
 
-	ds2, _, cfg2, _, err := LoadPhased(phasedPath)
+	ds2, _, cfg2, _, version, err := LoadPhased(phasedPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if version != "1.1" {
+		t.Fatalf("expected current format version 1.1, got %q", version)
+	}
 	var buf2 bytes.Buffer
-	if err := output.WritePhased(&buf2, ds2, phase.Run(ds2, cfg2), cfg2); err != nil {
+	if err := output.WritePhasedVersion(&buf2, ds2, phase.Run(ds2, cfg2), cfg2, version); err != nil {
 		t.Fatal(err)
 	}
 	if buf.String() != buf2.String() {

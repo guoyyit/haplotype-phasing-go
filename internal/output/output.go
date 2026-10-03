@@ -12,14 +12,29 @@ import (
 )
 
 // FileVersion is the stable phased-output format version.
-const FileVersion = "1.0"
+const FileVersion = "1.1"
+
+// LegacyFileVersion is the first released format. It remains readable and
+// reproducible: -reread writes violation rows exactly as the 1.0 writer did.
+const LegacyFileVersion = "1.0"
 
 // WritePhased writes the stable, re-readable phased result format.
 func WritePhased(w io.Writer, ds *model.Dataset, res *model.Result, cfg config.Config) error {
+	return WritePhasedVersion(w, ds, res, cfg, FileVersion)
+}
+
+// WritePhasedVersion writes the phased result using the requested format
+// version. Only FileVersion (current) and LegacyFileVersion are supported;
+// the legacy path exists solely so pre-existing 1.0 result files verify
+// byte-for-byte under -reread.
+func WritePhasedVersion(w io.Writer, ds *model.Dataset, res *model.Result, cfg config.Config, version string) error {
+	if version != FileVersion && version != LegacyFileVersion {
+		return fmt.Errorf("unsupported phased output format version %q", version)
+	}
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 
-	fmt.Fprintf(bw, "#haplophased\t%s\n", FileVersion)
+	fmt.Fprintf(bw, "#haplophased\t%s\n", version)
 
 	// #variants
 	fmt.Fprintln(bw, "#variants")
@@ -58,11 +73,16 @@ func WritePhased(w io.Writer, ds *model.Dataset, res *model.Result, cfg config.C
 	for _, sample := range res.Order {
 		sr := res.Samples[sample]
 		for _, sp := range sr.Sites {
+			h1Name, h2Name := alleleName(sp.H1, sp.A0, sp.A1), alleleName(sp.H2, sp.A0, sp.A1)
+			// Format 1.0 left violating heterozygous sites without haplotype
+			// calls ("."); 1.1 records the observed canonical alleles so the
+			// original genotype reconstructs exactly on re-read.
+			if version == LegacyFileVersion && sp.Violation && sp.Hetero {
+				h1Name, h2Name = ".", "."
+			}
 			fmt.Fprintf(bw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				sample, sp.Index, sp.VariantID, siteStatus(sp),
-				bit(sp.LowCov), sp.A0, sp.A1,
-				alleleName(sp.H1, sp.A0, sp.A1),
-				alleleName(sp.H2, sp.A0, sp.A1),
+				bit(sp.LowCov), sp.A0, sp.A1, h1Name, h2Name,
 				bit(sp.Violation))
 		}
 	}

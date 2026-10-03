@@ -76,7 +76,7 @@ func runCLI(args []string) error {
 // verifyReread loads a phased file, re-phases it and checks byte equality
 // of the regenerated phased representation with the stored config.
 func verifyReread(path string) error {
-	ds, _, cfg, notices, err := parseinput.LoadPhased(path)
+	ds, _, cfg, notices, version, err := parseinput.LoadPhased(path)
 	if err != nil {
 		return err
 	}
@@ -85,27 +85,67 @@ func verifyReread(path string) error {
 	}
 	regenerated := phase.Run(ds, cfg)
 	var buf bytes.Buffer
-	if err := output.WritePhased(&buf, ds, regenerated, cfg); err != nil {
+	if err := output.WritePhasedVersion(&buf, ds, regenerated, cfg, version); err != nil {
 		return err
 	}
 	original, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	if normalizeLines(string(original)) != normalizeLines(buf.String()) {
-		return fmt.Errorf("reread verification FAILED: re-phasing produced a different result")
+	if diff := firstLineDiff(string(original), buf.String()); diff != nil {
+		return fmt.Errorf("reread verification FAILED for format version %s: first mismatch at line %d\n  original: %q\nrephased: %q\n%s",
+			version, diff.lineNo, diff.original, diff.rephased, legacyVersionHint(version))
 	}
 	fmt.Println("reread verification OK: identical phasing")
 	return nil
 }
 
-// normalizeLines drops trailing whitespace per line for tolerant comparison.
-func normalizeLines(s string) string {
+type lineDiff struct {
+	lineNo             int
+	original, rephased string
+}
+
+// firstLineDiff returns the first differing physical line (1-based),
+// including lines present on only one side of the comparison.
+func firstLineDiff(original, regenerated string) *lineDiff {
+	a := splitNormalizedLines(original)
+	b := splitNormalizedLines(regenerated)
+	n := len(a)
+	if len(b) > n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		var la, lb string
+		if i < len(a) {
+			la = a[i]
+		}
+		if i < len(b) {
+			lb = b[i]
+		}
+		if la != lb {
+			return &lineDiff{lineNo: i + 1, original: la, rephased: lb}
+		}
+	}
+	return nil
+}
+
+func splitNormalizedLines(s string) []string {
 	var out []string
 	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
 		out = append(out, strings.TrimRight(line, "\r "))
 	}
-	return strings.Join(out, "\n")
+	return out
+}
+
+// legacyVersionHint explains the known, locatable limits of format 1.0
+// round-tripping instead of presenting them as unexplained failures.
+func legacyVersionHint(version string) string {
+	if version == output.LegacyFileVersion {
+		return "compatibility note: format 1.0 files are re-emitted byte-identically under 1.0 rules; " +
+			"historical rows produced by the 1.0 left-missing-marker parsing defect are preserved verbatim, " +
+			"and re-running the original inputs under 1.1 produces corrected PARTIAL rows."
+	}
+	return ""
 }
 
 func writeAtomic(path string, fn func(*os.File) error) error {

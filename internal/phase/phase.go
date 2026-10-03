@@ -362,13 +362,21 @@ func buildSitePhases(ds *model.Dataset, sample string, sites []siteInfo, layout 
 		case info.violated:
 			sp.Phased = false
 			sp.Hetero = info.hetero
-			if info.present && info.ploidy == 2 && !info.hetero {
+			if info.present && info.ploidy == 2 {
 				gt := ds.GT[sample][i]
 				call := model.AlleleA0
 				if gt.A1 != info.a0 && gt.A1 == info.a1 {
 					call = model.AlleleA1
 				}
-				sp.H1, sp.H2 = call, call
+				if info.hetero {
+					// Record the two observed canonical alleles in the
+					// documented unordered form (A0 then A1). The site stays
+					// UNPHASED/violation=1, but the original genotype and
+					// all violation statistics survive the write/re-read.
+					sp.H1, sp.H2 = model.AlleleA0, model.AlleleA1
+				} else {
+					sp.H1, sp.H2 = call, call
+				}
 			}
 		case info.hetero:
 			sp.Phased = true
